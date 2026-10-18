@@ -106,7 +106,7 @@ install_rrws() {
 
 install_malwdns() {
     # Устанавливаем MALWDNS_PARSER
-	sh <(wget -qO- https://raw.githubusercontent.com/kkkkCampbell/master/refs/heads/malw_parser/malw_parser.sh) noclear
+	sh <(wget -qO- https://raw.githubusercontent.com/bogoslavskiy/zbautoconf/refs/heads/malw_parser-fixes/malw_parser.sh) noclear
     echo ""
 }
 
