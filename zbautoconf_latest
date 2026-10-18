@@ -76,6 +76,54 @@ del_awg10() {
 	fi
 }
 
+# Рабочий WARP (awg10) не пересоздаём: новая регистрация может попасть на заблокированные адреса
+AWG_KEEP="$LOG_DIR/awg10_keep.uci"
+KEEP_AWG10=0
+
+awg10_alive() {
+	TS=$(awg show awg10 latest-handshakes 2>/dev/null | awk '{print $2; exit}')
+	[ -n "$TS" ] && [ "$TS" -gt 0 ] 2>/dev/null && [ $(( $(date +%s) - TS )) -lt 180 ]
+}
+
+save_awg10() {
+	rm -f "$AWG_KEEP"
+	awg10_alive || { echo "→ WARP (awg10) не работает — будет настроен заново"; return 0; }
+	(umask 077; uci export network | awk -v q="'" '
+		/^config /{ keep = ($2 == "amneziawg_awg10" || ($2 == "interface" && $3 == q "awg10" q)) }
+		keep' > "$AWG_KEEP")
+	grep -q "^config interface 'awg10'" "$AWG_KEEP" || { rm -f "$AWG_KEEP"; return 0; }
+	KEEP_AWG10=1
+	echo "✓ WARP (awg10) работает — сохраняем его как есть"
+}
+
+restore_awg10() {
+	[ "$KEEP_AWG10" = 1 ] && [ -s "$AWG_KEEP" ] || return 0
+	echo "→ Проверяем WARP (awg10)..."
+	for i in $(seq 1 18); do
+		awg10_alive && { echo "✓ WARP работает"; return 0; }
+		sleep 5
+	done
+	echo "→ WARP не подключился — возвращаем прежний рабочий awg10"
+	uci -q delete network.awg10
+	while uci -q delete network."@amneziawg_awg10"[0] >/dev/null 2>&1; do :; done
+	awk -v q="'" '
+		/^config /{
+			if ($3 != "") { n = $3; gsub(q, "", n); ref = "network." n; print "set " ref "=" $2 }
+			else { ref = "network.@" $2 "[-1]"; print "add network " $2 }
+			next }
+		/^[ \t]*(option|list) /{
+			cmd = ($1 == "list") ? "add_list" : "set"; k = $2
+			sub(/^[ \t]*[a-z]+ [^ ]+ /, ""); print cmd " " ref "." k "=" $0 }
+	' "$AWG_KEEP" | uci batch >/dev/null
+	uci commit network
+	ifup awg10
+	for i in $(seq 1 6); do
+		awg10_alive && { echo "✓ Прежний WARP восстановлен"; return 0; }
+		sleep 5
+	done
+	echo -e "${YELLOW}⚠ WARP пока не подключился — ZeroBlock продолжит попытки сам${CLR_OFF}"
+}
+
 
 opkg_update(){
 	# opkg update в цикле 4 раза
@@ -983,6 +1031,8 @@ on_the_end() {
 	#	uci add_list zeroblock.opera.community_lists="$item"
 	# done; sleep 1; uci commit; uci commit luci;	sleep 1
     
+	restore_awg10
+
     # Изменяем параметры awg10
 	echo "→ Изменяем параметры awg10"
     uci set network.awg10.mtu='1280'
@@ -1027,12 +1077,18 @@ create_backup_dir
 create_backup
 verify_backup "${BACKUP_FILE}"
 # очищаем папку /etc/zeroblock от старых файлов (после бэкапа)
-find /etc/zeroblock -maxdepth 1 -type f -exec rm -f -- {} +
+save_awg10
+if [ "$KEEP_AWG10" = 1 ]; then
+	# метки владения нужны, чтобы ZeroBlock считал сохранённый awg10 своим
+	find /etc/zeroblock -maxdepth 1 -type f ! -name state.json ! -name .auto_component_ownership_v1 -exec rm -f -- {} +
+else
+	find /etc/zeroblock -maxdepth 1 -type f -exec rm -f -- {} +
+fi
 kill_annoying_services
 # Сбрасываем Зероблок
 echo "→ Сбрасываем настройки ZeroBlock"
 ubus call zeroblock restore_to_default >/dev/null 2>&1
-del_awg10
+[ "$KEEP_AWG10" = 1 ] || del_awg10
 dns_redirect "${TEMP_DNS}"
 sleep 5
 opkg_update
