@@ -115,107 +115,19 @@ $opkg $install wget-ssl
 }
 
 
-install_zb_newest() {
-	no_zb_arch=0
-	ZB_ARCH_LINK="https://raw.githubusercontent.com/kkkkCampbell/master/refs/heads/zbautoconf/ZeroBlock_latest_$MOD.tar.gz"
-	
-	WORK_DIR="/tmp/zb_arch_work"
-	rm -rf "$WORK_DIR"
-	mkdir -p "$WORK_DIR"
-	cd "$WORK_DIR" || return 1
-	
-	printf "Скачивание свежего ZeroBlock\n"
-	sleep 5
-	
-	wget_attempt=1
-	max_attempts=4
-	while [ $wget_attempt -le $max_attempts ]; do
-		echo "Попытка скачивания $wget_attempt из $max_attempts..."
-		
-		if wget -O "archive.tar.gz" "$ZB_ARCH_LINK" --timeout=5; then
-			echo -e "${GREEN}Скачивание успешно${CLR_OFF}"; echo ""
-			break
-		else
-			echo -e "${RED_BRIGHT}Ошибка скачивания${CLR_OFF}"
-			wget_attempt=$((wget_attempt + 1))
-			
-			if [ $wget_attempt -gt $max_attempts ]; then
-				echo -e "${YELLOW}Не удалось скачать после $max_attempts попыток${CLR_OFF}"
-				no_zb_arch=1
-				return 1
-			fi
-			
-			sleep 2
-		fi
-	done
-	
-	echo -e "Распаковка..."
-	tar -xzf "archive.tar.gz" -C "$WORK_DIR" || {
-		echo -e "${RED_BRIGHT}Ошибка распаковки${CLR_OFF}"
-		no_zb_arch=1
-		return 1
-	}
-	
-	rm -f "archive.tar.gz"
-	
-	# Простой поиск самого большого файла для установки
-	LARGEST_FILE=""
-	LARGEST_SIZE=0
-	
-	for file in $(find "$WORK_DIR" -name "*.${MOD}" -type f 2>/dev/null); do
-		size=$(ls -la "$file" | awk '{print $5}')
-		if [ "$size" -gt "$LARGEST_SIZE" ]; then
-		echo "$file"
-			LARGEST_SIZE=$size
-			LARGEST_FILE=$file
-		fi
-	done
-	
-	if [ -z "$LARGEST_FILE" ]; then
-		echo -e "${RED_BRIGHT}Ошибка: нет .$MOD файлов${CLR_OFF}"
-		no_zb_arch=1
-		return 1
-	fi
-	
-
-	echo -e "Установка: $(basename "$LARGEST_FILE")"
-	$opkg $install "$LARGEST_FILE" || {
-		echo -e "${RED_BRIGHT}Ошибка установки${CLR_OFF}"
-		no_zb_arch=1
-		return 1
-	}
-	
-	# Второй файл
-	for file in $(find "$WORK_DIR" -name "*.${MOD}" -type f 2>/dev/null | grep -v "$LARGEST_FILE"); do
-		echo -e "Установка: $(basename "$file")"
-		$opkg $install "$file" || echo -e "${YELLOW}Предупреждение: не установлен $file${CLR_OFF}"
-		break
-	done
-	
-	echo -e "${GREEN}ZeroBlock установлен. ${CLR_OFF}"
-	return 0
-}
-
 # Установка zeroblock с "защитой" от ТСПУ
 install_zb_repo() {
 
-	[ "$no_zb_arch" != "1" ] && return 0
-	
-
-	rm -f /etc/config/zeroblock
-
-	# -1) Проверка, установлен ли zeroblock
-	if $opkg $list_installed 2>/dev/null | grep -q "^zeroblock -"; then
-		echo -e "✓ zeroblock уже установлен"
-		return 0
-	fi
-	
 	new_install=1
-	# opkg_update
 
-	# 5) Установка zeroblock
-	echo -e "→ Установка zeroblock luci-app-zeroblock..."
-	$opkg $install zeroblock luci-app-zeroblock > /tmp/opkg_install.log 2>&1
+	# Установка или обновление zeroblock из официального репозитория RouteRich
+	echo -e "→ Установка/обновление zeroblock luci-app-zeroblock из репозитория..."
+	if [ "$MOD" = "apk" ]; then
+		$opkg $install -u zeroblock luci-app-zeroblock > /tmp/opkg_install.log 2>&1
+	else
+		$opkg $install zeroblock luci-app-zeroblock > /tmp/opkg_install.log 2>&1
+		$opkg upgrade zeroblock luci-app-zeroblock >> /tmp/opkg_install.log 2>&1
+	fi
 	
 	# 6) Проверка установки
 	if $opkg $list_installed 2>/dev/null | grep -q "^zeroblock -"; then
@@ -225,6 +137,11 @@ install_zb_repo() {
 		cat /tmp/opkg_install.log
 		return 1
 	fi
+}
+
+# 32 случайных hex-символа
+random_hex() {
+	hexdump -n 16 -e '16/1 "%02x"' /dev/urandom
 }
 
 # Функция создания директории
@@ -761,7 +678,7 @@ config engine 'engine'
 	option bootstrap_readiness_timeout '30'
 	option dns_runtime_fallback_enabled '0'
 	option bootstrap_dns_type 'doh'
-	option use_zeroblock_dns_directly '1'
+	option use_zeroblock_dns_directly '0'
 	option dns_optimistic_cache '0'
 	option block_dot_doq '0'
 	option exclude_ipsec '0'
@@ -778,7 +695,7 @@ config engine 'engine'
 	option naive_version_timeout '10'
 	option naive_hash_timeout '10'
 	option singbox_transport_check_timeout '10'
-	option fptn_status_secret 'f9ecbb531301894dbf510a874d1ff900'
+	option fptn_status_secret '__FPTN_SECRET__'
 	option openflux_logging '0'
 	option openflux_path '/usr/bin/universal-bypass-tool'
 	option openflux_startup_timeout '8'
@@ -786,9 +703,10 @@ config engine 'engine'
 	option tailscale_rescue_enabled '0'
 	option clash_ui_download_url 'https://files.routerich.ru/zb/yacd.zip'
 	option clash_ui_download_url_locked '0'
-	option yacd_secret_key '5f8698fe21cf5de75817cb904ace3d7d'
+	option yacd_secret_key '__YACD_SECRET__'
 EOF
 
+	sed -i -e "s/__FPTN_SECRET__/$(random_hex)/" -e "s/__YACD_SECRET__/$(random_hex)/" /etc/config/zeroblock
 	echo -e "✓ Конфиг zeroblock заменён"
 
 	# /etc/init.d/zeroblock start 2>/dev/null
@@ -824,14 +742,14 @@ wait_zeroblock_ready() {
 	done
 	
 	echo -e ""
-	#echo -e "⚠ Таймаут: автонастройка не завершилась за 1 минуту"
+	echo -e "${YELLOW}⚠ Таймаут: автонастройка не завершилась за 2 минуты${CLR_OFF}"
 	return 1
 }
 
 # Управление DNS (аргумент = IP DNS сервера, или recovery = восстановление)
 dns_redirect() {
 	# если передан аргумент 'recovery' для восстановления DNS 
-	if [ "$1" = "recovery" ] && [ "$NOBACKUP" = "" ]; then
+	if [ "$1" = "recovery" ]; then
 		# Восстановление
 		if [ -f /tmp/dhcp.bak ]; then
 			cp /tmp/dhcp.bak /etc/config/dhcp
@@ -842,14 +760,7 @@ dns_redirect() {
 		
 	elif echo -e "$1" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
 		# Бэкап
-		retval="$(uci get dhcp.@dnsmasq[0].server 2>/dev/null | tr -d '[:space:]')"
-		if [ -n "$retval" ]; then
-		  cp /etc/config/dhcp /tmp/dhcp.bak 2>/dev/null
-		  NOBACKUP=""
-		 else
-		  echo -e "✗ Передан DNS ${1}. Архивация пропущена."
-		  NOBACKUP="1"
-		fi
+		cp /etc/config/dhcp /tmp/dhcp.bak 2>/dev/null
 		
 		/etc/init.d/zeroblock stop >/dev/null 2>&1
 		sleep 3
@@ -913,8 +824,6 @@ draw_main_menu() {
 	case "$input" in
 		1)  echo -e ""
 			echo -e "${GREEN}→ Запуск установки и настройки...${CLR_OFF}"
-			# очищаем папку /etc/zeroblock от старых файлов
-			find /etc/zeroblock -maxdepth 1 -type f -exec rm -f -- {} +
 			return 0
 			;;
 		2) if [ "$BACKUP_COUNT" -gt 0 ]; then
@@ -1117,6 +1026,8 @@ draw_main_menu
 create_backup_dir
 create_backup
 verify_backup "${BACKUP_FILE}"
+# очищаем папку /etc/zeroblock от старых файлов (после бэкапа)
+find /etc/zeroblock -maxdepth 1 -type f -exec rm -f -- {} +
 kill_annoying_services
 # Сбрасываем Зероблок
 echo "→ Сбрасываем настройки ZeroBlock"
@@ -1128,8 +1039,7 @@ opkg_update
 install_prereq
 install_rrws
 install_malwdns
-install_zb_newest; echo -e ""
-install_zb_repo # если новейший не установлен, устанавливаем из репы
+install_zb_repo
 stop_and_rplce_config_zeroblock
 wait_zeroblock_ready
 dns_redirect "recovery"
