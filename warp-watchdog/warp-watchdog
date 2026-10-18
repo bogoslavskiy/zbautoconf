@@ -1,0 +1,335 @@
+#!/bin/sh
+# WARP watchdog: keeps the awg10 tunnel on a working Cloudflare WARP endpoint.
+#
+# Every 10 s: if traffic is coming in, the tunnel is alive; if it is quiet, one ping
+# through it decides. 3 misses in a row = dead -> switch at once to the next endpoint.
+# Every 60 s a 5-ping quality check, every hour a 1 MB speed test: a slow endpoint is
+# swapped only for a pre-tested, clearly better one. Endpoints change on the fly
+# (peer re-added, interface stays up) and the working one is saved to UCI.
+#
+# Usage: warp-watchdog run | status | scan        DRY_RUN=1 logs decisions only.
+
+IFACE=awg10
+CONF_DIR=${CONF_DIR:-/etc/warp-watchdog}
+ACCOUNT=$CONF_DIR/account.json
+GOOD=$CONF_DIR/good              # endpoints that worked here, newest first
+STATE=${STATE:-/tmp/warp-watchdog}
+CANDS=$STATE/candidates          # latest scan, best first
+BENCH=$STATE/bench               # "ip:port until_epoch"
+STATUS=$STATE/status
+
+PROBE_IP=${PROBE_IP:-1.1.1.1}
+WAN_IPS="77.88.8.8 5.255.255.242"
+TICK=10
+DEAD_FAILS=3
+HS_MAX=${HS_MAX:-200}                      # keepalive 25 s -> a live tunnel re-handshakes every ~2 min
+QUALITY_EVERY=60
+SLOW_ROUNDS=2
+SLOW_SWITCH_GAP=300
+SPEED_EVERY=3600
+SPEED_MIN=250000                 # bytes/s (2 Mbit/s)
+SPEED_URL="https://speed.cloudflare.com/__down?bytes=1000000"
+SPEED_RESOLVE="speed.cloudflare.com:443:162.159.140.220,172.66.0.218"
+SCAN_EVERY=21600
+BENCH_SECS=1800
+MAX_TRIES=8
+DRY_RUN=${DRY_RUN:-0}
+
+# Used when no scan has run yet: WARP pools and the ports that get through here
+SEED_NETS="162.159.192 162.159.195 188.114.96 188.114.97 188.114.98 188.114.99 8.6.112 8.34.70 8.34.146 8.35.211 8.39.125 8.39.204 8.39.214 8.47.69"
+SEED_PORTS="2408 500 1701 4500"
+
+mkdir -p "$STATE" "$CONF_DIR"
+touch "$BENCH" "$GOOD" "$CANDS"
+
+log() { logger -t warp-watchdog "$*"; [ -t 1 ] && echo "$(date '+%T') $*"; }
+now() { date +%s; }
+
+peer() { awg show "$IFACE" peers 2>/dev/null | head -n1; }
+endpoint() { awg show "$IFACE" endpoints 2>/dev/null | awk '{print $2; exit}'; }
+rx() { awg show "$IFACE" transfer 2>/dev/null | awk '{print $2; exit}'; }
+hs() { awg show "$IFACE" latest-handshakes 2>/dev/null | awk '{print $2; exit}'; }
+net24() { echo "${1%:*}" | cut -d. -f1-3; }
+
+ping_tun() { ping -c1 -W2 -I "$IFACE" "$PROBE_IP" >/dev/null 2>&1; }
+
+wan_ok() {
+	for ip in $WAN_IPS; do ping -c1 -W2 "$ip" >/dev/null 2>&1 && return 0; done
+	return 1
+}
+
+# netifd or ZeroBlock just (re)built the interface - leave it alone for a minute
+iface_settling() {
+	up=$(ubus call network.interface."$IFACE" status 2>/dev/null | jsonfilter -e '@.uptime')
+	[ -z "$up" ] || [ "$up" -lt 60 ]
+}
+
+# "loss_of_5 avg_ms"
+quality() {
+	ping -c5 -W1 -I "$IFACE" "$PROBE_IP" 2>/dev/null | awk '
+		/packets transmitted/ { loss = $1 - $4 }
+		/round-trip/ { split($4, a, "/"); avg = int(a[2] + 0.5) }
+		END { if (loss == "") loss = 5; if (avg == "") avg = 0; print loss, avg }'
+}
+
+speed() {
+	curl -4 -s --interface "$IFACE" -m 20 --resolve "$SPEED_RESOLVE" -o /dev/null \
+		-w '%{speed_download}' "$SPEED_URL" 2>/dev/null | cut -d. -f1
+}
+
+benched() {
+	awk -v e="$1" -v t="$(now)" '$1 == e && $2 > t { f = 1 } END { exit !f }' "$BENCH"
+}
+
+bench() {
+	awk -v e="$1" -v t="$(now)" '$1 != e && $2 > t' "$BENCH" > "$BENCH.tmp"
+	echo "$1 $(( $(now) + BENCH_SECS ))" >> "$BENCH.tmp"
+	mv "$BENCH.tmp" "$BENCH"
+}
+
+remember_good() {
+	{ echo "$1"; grep -vxF "$1" "$GOOD"; } | head -n 20 > "$GOOD.tmp"
+	mv "$GOOD.tmp" "$GOOD"
+}
+
+seed() {
+	for n in $SEED_NETS; do
+		for p in $SEED_PORTS; do
+			echo "$RANDOM $n.$(( RANDOM % 254 + 1 )):$p"
+		done
+	done | sort -n | awk '{print $2}'
+}
+
+# Next endpoint to try: known-good first, then the scan, then random seeds;
+# a different /24 than the current one first, since blocks tend to hit a whole range
+pick() {
+	cur=$1
+	cur_net=$(net24 "$cur")
+	for pass in other same; do
+		for e in $(cat "$GOOD" "$CANDS"; seed); do
+			[ "$e" = "$cur" ] && continue
+			if [ "$pass" = other ]; then
+				[ "$(net24 "$e")" = "$cur_net" ] && continue
+			fi
+			benched "$e" && continue
+			echo "$e"
+			return 0
+		done
+	done
+	return 1
+}
+
+# Re-adding the peer drops its old session, so the new endpoint handshakes at once
+apply() {
+	ep=$1
+	[ "$DRY_RUN" = 1 ] && { log "dry run: would switch to $ep"; return 0; }
+	pub=$(peer)
+	[ -n "$pub" ] || return 1
+	ips=$(awg show "$IFACE" allowed-ips | awk '{ $1 = ""; sub(/^ /, ""); gsub(/ /, ","); print; exit }')
+	ka=$(awg show "$IFACE" persistent-keepalive | awk '{print $2; exit}')
+	case "$ka" in ''|off) ka=25 ;; esac
+	psk=$(awg show "$IFACE" preshared-keys | awk '{print $2; exit}')
+	pskarg=""
+	if [ -n "$psk" ] && [ "$psk" != "(none)" ]; then
+		(umask 077; echo "$psk" > "$STATE/psk")
+		pskarg="preshared-key $STATE/psk"
+	fi
+	awg set "$IFACE" peer "$pub" remove
+	awg set "$IFACE" peer "$pub" endpoint "$ep" allowed-ips "${ips:-0.0.0.0/0,::/0}" \
+		persistent-keepalive "$ka" $pskarg
+	rm -f "$STATE/psk"
+}
+
+# New handshake after $2 and a ping through the tunnel
+verify() {
+	t0=$2
+	[ "$DRY_RUN" = 1 ] && return 0
+	i=0
+	while [ $i -lt 8 ]; do
+		h=$(hs)
+		[ "${h:-0}" -ge "$t0" ] && ping_tun && return 0
+		sleep 1
+		i=$((i + 1))
+	done
+	return 1
+}
+
+persist() {
+	[ "$DRY_RUN" = 1 ] && return 0
+	uci set network.@amneziawg_"$IFACE"[0].endpoint_host="${1%:*}"
+	uci set network.@amneziawg_"$IFACE"[0].endpoint_port="${1##*:}"
+	uci commit network
+}
+
+switch_dead() {
+	cur=$(endpoint)
+	bench "$cur"
+	n=0
+	while [ $n -lt $MAX_TRIES ]; do
+		ep=$(pick "$cur") || break
+		t0=$(now)
+		apply "$ep"
+		if verify "$ep" "$t0"; then
+			persist "$ep"
+			remember_good "$ep"
+			log "switched $cur -> $ep ($1), took $(( $(now) - t0 ))s"
+			return 0
+		fi
+		log "endpoint $ep did not answer"
+		bench "$ep"
+		n=$((n + 1))
+	done
+	log "no working endpoint after $n tries, back to $cur"
+	apply "$cur"
+	return 1
+}
+
+# Pre-test outside the live tunnel; switch only if clearly better, else stay
+switch_better() {
+	cur=$(endpoint)
+	cur_ms=$2
+	[ -s "$ACCOUNT" ] || { log "slow ($1), but no scan account yet - staying on $cur"; return 1; }
+	ep=$(pick "$cur") || return 1
+	jc=$(uci -q get network."$IFACE".awg_jc); jmin=$(uci -q get network."$IFACE".awg_jmin); jmax=$(uci -q get network."$IFACE".awg_jmax)
+	rm -f "$STATE/pretest.txt"
+	nice -n 19 rrws scan -a "$ACCOUNT" -p awg -jc "${jc:-6}" -jmin "${jmin:-10}" -jmax "${jmax:-50}" \
+		-target "${ep%:*}" -port "${ep##*:}" -tun-ping -o "$STATE/pretest.txt" >/dev/null 2>&1
+	new_ms=$(awk -v e="$ep" '$1 == e { sub(/ms/, "", $3); print $3; exit }' "$STATE/pretest.txt" 2>/dev/null)
+	if [ -z "$new_ms" ]; then
+		log "slow ($1); candidate $ep failed the pre-test"
+		bench "$ep"
+		return 1
+	fi
+	if [ "$cur_ms" -gt 0 ] && [ $((new_ms * 10)) -ge $((cur_ms * 7)) ]; then
+		log "slow ($1); candidate $ep is not clearly better (${new_ms}ms vs ${cur_ms}ms), staying"
+		return 1
+	fi
+	t0=$(now)
+	apply "$ep"
+	if verify "$ep" "$t0"; then
+		persist "$ep"
+		remember_good "$ep"
+		log "switched $cur -> $ep ($1; ${cur_ms}ms -> ${new_ms}ms)"
+		return 0
+	fi
+	log "candidate $ep passed the pre-test but not live, back to $cur"
+	bench "$ep"
+	apply "$cur"
+	return 1
+}
+
+scan() {
+	exec 9>"$STATE/scan.lock"
+	flock -n 9 || return 0
+	if [ ! -s "$ACCOUNT" ]; then
+		rrws register -a "$ACCOUNT" >/dev/null 2>&1 ||
+			rrws register -x http://127.0.0.2:19999 -a "$ACCOUNT" >/dev/null 2>&1
+		[ -s "$ACCOUNT" ] || { log "scan: could not register a scan account"; return 1; }
+	fi
+	jc=$(uci -q get network."$IFACE".awg_jc); jmin=$(uci -q get network."$IFACE".awg_jmin); jmax=$(uci -q get network."$IFACE".awg_jmax)
+	rm -f "$STATE/scan.txt"
+	nice -n 19 rrws scan -a "$ACCOUNT" -p awg -jc "${jc:-6}" -jmin "${jmin:-10}" -jmax "${jmax:-50}" \
+		-n 3 -o "$STATE/scan.txt" >/dev/null 2>&1
+	awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+ / && !s[$1]++ { print $1 }
+		/^# Best endpoint/ { exit }' "$STATE/scan.txt" 2>/dev/null > "$CANDS.tmp"
+	if [ -s "$CANDS.tmp" ]; then
+		mv "$CANDS.tmp" "$CANDS"
+		log "scan: $(wc -l < "$CANDS") working endpoints"
+	else
+		rm -f "$CANDS.tmp"
+		log "scan: nothing found, keeping the previous list"
+	fi
+}
+
+write_status() {
+	cat > "$STATUS" <<-EOF
+	endpoint=$(endpoint)
+	handshake_age=$(( $(now) - $(hs || true) + 0 ))s
+	fails=$fails
+	loss=$q_loss/5 rtt=${q_ms}ms base=${base}ms slow_rounds=$slow
+	speed=${sp:-?} B/s
+	candidates=$(wc -l < "$CANDS") good=$(wc -l < "$GOOD") benched=$(awk -v t="$(now)" '$2 > t' "$BENCH" | wc -l)
+	updated=$(date '+%F %T')
+	EOF
+}
+
+run() {
+	log "started (dry_run=$DRY_RUN)"
+	# let ZeroBlock finish its own start-up work on the tunnel first
+	sleep "${START_DELAY:-120}"
+	last_rx=$(rx); fails=0; slow=0; base=0; q_loss=0; q_ms=0; sp=""
+	t=$(now)
+	next_q=$t; next_speed=$((t + 300)); next_scan=$((t + 60)); last_better=0
+	while true; do
+		sleep $TICK
+		t=$(now)
+		if [ "$t" -ge "$next_scan" ]; then
+			next_scan=$((t + SCAN_EVERY))
+			scan &
+		fi
+		if ! ip link show "$IFACE" >/dev/null 2>&1 || iface_settling; then
+			fails=0; last_rx=$(rx)
+			continue
+		fi
+
+		r=$(rx); h=$(hs)
+		if [ "$r" != "$last_rx" ] && [ $((t - ${h:-0})) -lt $HS_MAX ]; then
+			fails=0
+		elif ping_tun; then
+			fails=0
+		else
+			fails=$((fails + 1))
+		fi
+		last_rx=$r
+
+		if [ $fails -ge $DEAD_FAILS ]; then
+			if wan_ok; then
+				switch_dead "no answer for $((fails * TICK))s"
+				base=0; slow=0
+			else
+				log "internet itself is down, not switching"
+			fi
+			fails=0; last_rx=$(rx)
+			write_status
+			continue
+		fi
+
+		if [ "$t" -ge "$next_q" ]; then
+			next_q=$((t + QUALITY_EVERY))
+			set -- $(quality); q_loss=$1; q_ms=$2
+			if [ "$q_loss" -lt 5 ]; then
+				[ "$base" -eq 0 ] || [ "$q_ms" -lt "$base" ] && base=$q_ms
+				if [ "$q_loss" -ge 2 ] || { [ "$q_ms" -gt $((base * 3)) ] && [ "$q_ms" -gt $((base + 50)) ]; }; then
+					slow=$((slow + 1))
+				else
+					slow=0
+				fi
+			fi
+			if [ $slow -ge $SLOW_ROUNDS ] && [ $((t - last_better)) -ge $SLOW_SWITCH_GAP ]; then
+				last_better=$t
+				# with packet loss any pre-tested endpoint is better; otherwise it must be faster
+				[ "$q_loss" -ge 2 ] && cmp_ms=0 || cmp_ms=$q_ms
+				switch_better "loss $q_loss/5, ${q_ms}ms vs usual ${base}ms" "$cmp_ms" && base=0
+				slow=0; last_rx=$(rx)
+			fi
+		fi
+
+		if [ "$t" -ge "$next_speed" ]; then
+			next_speed=$((t + SPEED_EVERY))
+			sp=$(speed)
+			if [ "${sp:-0}" -lt $SPEED_MIN ] && [ $((t - last_better)) -ge $SLOW_SWITCH_GAP ]; then
+				last_better=$t
+				switch_better "speed $((${sp:-0} / 1000)) KB/s" 0 && base=0
+				last_rx=$(rx)
+			fi
+		fi
+		write_status
+	done
+}
+
+case "$1" in
+	run) run ;;
+	scan) scan; cat "$CANDS" ;;
+	status) cat "$STATUS" 2>/dev/null || echo "not running"; logread -e warp-watchdog 2>/dev/null | tail -n 10 ;;
+	*) echo "Usage: $0 run|status|scan"; exit 1 ;;
+esac

@@ -152,6 +152,12 @@ install_rrws() {
     echo ""
 }
 
+install_warp_watchdog() {
+    # Устанавливаем WARP watchdog
+	sh <(wget -qO- https://raw.githubusercontent.com/bogoslavskiy/zbautoconf/refs/heads/main/warp_watchdog.sh) noclear
+    echo ""
+}
+
 install_malwdns() {
     # Устанавливаем MALWDNS_PARSER
 	sh <(wget -qO- https://raw.githubusercontent.com/bogoslavskiy/zbautoconf/refs/heads/main/malw_parser.sh) noclear
@@ -1101,6 +1107,8 @@ wait_zeroblock_ready
 dns_redirect "recovery"
 refresh_luci
 on_the_end
+# после установки ZeroBlock, чтобы watchdog не мешал ему настраивать WARP
+install_warp_watchdog
 
 #echo "→ Перезапуск сети"
 #service network restart
