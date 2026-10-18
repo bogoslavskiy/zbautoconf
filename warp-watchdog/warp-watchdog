@@ -1,8 +1,9 @@
 #!/bin/sh
 # WARP watchdog: keeps the awg10 tunnel on a working Cloudflare WARP endpoint.
 #
-# Every 10 s: if traffic is coming in, the tunnel is alive; if it is quiet, one ping
-# through it decides. 3 misses in a row = dead -> switch at once to the next endpoint.
+# Every 10 s one ping through the tunnel (incoming bytes alone are no proof: replies
+# can keep arriving while our packets are dropped). 3 misses in a row = dead -> switch
+# at once to the next endpoint.
 # Every 60 s a 5-ping quality check, every hour a 1 MB speed test: a slow endpoint is
 # swapped only for a pre-tested, clearly better one. Endpoints change on the fly
 # (peer re-added, interface stays up) and the working one is saved to UCI.
@@ -22,7 +23,6 @@ PROBE_IP=${PROBE_IP:-1.1.1.1}
 WAN_IPS="77.88.8.8 5.255.255.242"
 TICK=10
 DEAD_FAILS=3
-HS_MAX=${HS_MAX:-200}                      # keepalive 25 s -> a live tunnel re-handshakes every ~2 min
 QUALITY_EVERY=60
 SLOW_ROUNDS=2
 SLOW_SWITCH_GAP=300
@@ -47,11 +47,10 @@ now() { date +%s; }
 
 peer() { awg show "$IFACE" peers 2>/dev/null | head -n1; }
 endpoint() { awg show "$IFACE" endpoints 2>/dev/null | awk '{print $2; exit}'; }
-rx() { awg show "$IFACE" transfer 2>/dev/null | awk '{print $2; exit}'; }
 hs() { awg show "$IFACE" latest-handshakes 2>/dev/null | awk '{print $2; exit}'; }
 net24() { echo "${1%:*}" | cut -d. -f1-3; }
 
-ping_tun() { ping -c1 -W2 -I "$IFACE" "$PROBE_IP" >/dev/null 2>&1; }
+ping_tun() { ping -c1 -W1 -I "$IFACE" "$PROBE_IP" >/dev/null 2>&1; }
 
 wan_ok() {
 	for ip in $WAN_IPS; do ping -c1 -W2 "$ip" >/dev/null 2>&1 && return 0; done
@@ -244,7 +243,7 @@ scan() {
 write_status() {
 	cat > "$STATUS" <<-EOF
 	endpoint=$(endpoint)
-	handshake_age=$(( $(now) - $(hs || true) + 0 ))s
+	handshake=$(h=$(hs); [ "${h:-0}" -gt 0 ] && echo "$(( $(now) - h ))s ago" || echo none)
 	fails=$fails
 	loss=$q_loss/5 rtt=${q_ms}ms base=${base}ms slow_rounds=$slow
 	speed=${sp:-?} B/s
@@ -257,39 +256,37 @@ run() {
 	log "started (dry_run=$DRY_RUN)"
 	# let ZeroBlock finish its own start-up work on the tunnel first
 	sleep "${START_DELAY:-120}"
-	last_rx=$(rx); fails=0; slow=0; base=0; q_loss=0; q_ms=0; sp=""
+	fails=0; slow=0; base=0; q_loss=0; q_ms=0; sp=""
 	t=$(now)
 	next_q=$t; next_speed=$((t + 300)); next_scan=$((t + 60)); last_better=0
 	while true; do
-		sleep $TICK
+		# after a miss, re-check every 3 s so a dead tunnel is confirmed quickly
+		if [ $fails -gt 0 ]; then sleep 3; else sleep $TICK; fi
 		t=$(now)
 		if [ "$t" -ge "$next_scan" ]; then
 			next_scan=$((t + SCAN_EVERY))
 			scan &
 		fi
 		if ! ip link show "$IFACE" >/dev/null 2>&1 || iface_settling; then
-			fails=0; last_rx=$(rx)
+			fails=0
 			continue
 		fi
 
-		r=$(rx); h=$(hs)
-		if [ "$r" != "$last_rx" ] && [ $((t - ${h:-0})) -lt $HS_MAX ]; then
-			fails=0
-		elif ping_tun; then
+		if ping_tun || ping_tun; then
 			fails=0
 		else
+			[ $fails -eq 0 ] && first_miss=$t
 			fails=$((fails + 1))
 		fi
-		last_rx=$r
 
 		if [ $fails -ge $DEAD_FAILS ]; then
 			if wan_ok; then
-				switch_dead "no answer for $((fails * TICK))s"
+				switch_dead "no answer for $(( $(now) - first_miss ))s"
 				base=0; slow=0
 			else
 				log "internet itself is down, not switching"
 			fi
-			fails=0; last_rx=$(rx)
+			fails=0
 			write_status
 			continue
 		fi
@@ -310,7 +307,7 @@ run() {
 				# with packet loss any pre-tested endpoint is better; otherwise it must be faster
 				[ "$q_loss" -ge 2 ] && cmp_ms=0 || cmp_ms=$q_ms
 				switch_better "loss $q_loss/5, ${q_ms}ms vs usual ${base}ms" "$cmp_ms" && base=0
-				slow=0; last_rx=$(rx)
+				slow=0
 			fi
 		fi
 
@@ -320,7 +317,6 @@ run() {
 			if [ "${sp:-0}" -lt $SPEED_MIN ] && [ $((t - last_better)) -ge $SLOW_SWITCH_GAP ]; then
 				last_better=$t
 				switch_better "speed $((${sp:-0} / 1000)) KB/s" 0 && base=0
-				last_rx=$(rx)
 			fi
 		fi
 		write_status
