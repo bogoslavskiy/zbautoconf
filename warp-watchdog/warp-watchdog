@@ -12,12 +12,18 @@
 # switch endpoint at once, no pre-test; at most 3 such switches per 10 min.
 # Every 30 s a real request to api.telegram.org through the tunnel: pings can pass while
 # Telegram's TCP stalls (files and messages stop loading). No valid answer within
-# 2.5 s twice in a row (re-checked on the next tick) -> switch endpoint, same limit.
+# 2.5 s twice in a row (re-checked on the next tick) -> new session (see below).
+# Every 30 s the exit colo too (cdn-cgi/trace through the tunnel). Cloudflare picks the
+# exit per session; from a Russian colo (DME = Moscow) Telegram stalls although pings and
+# Cloudflare itself work. The colo sticks to the session's addresses, so moving only the
+# endpoint can keep it - a new local port (and on later tries a new endpoint) re-rolls it,
+# no reboot needed. Each try is verified: foreign colo + api.telegram.org answers.
 # Every 30 s chatgpt.com through ZeroBlock's bootstrap proxy (it goes via Opera).
 # Broken twice in a row while WARP is up -> restart opera-proxy (if it is the one
 # dead) or sing-box; at most once per 10 min.
 #
-# Usage: warp-watchdog run | status | scan        DRY_RUN=1 logs decisions only.
+# Usage: warp-watchdog run | status | scan | colo | reroll   DRY_RUN=1 logs decisions only.
+# reroll = get a new session (new exit colo) by hand, no reboot.
 
 IFACE=awg10
 CONF_DIR=${CONF_DIR:-/etc/warp-watchdog}
@@ -27,6 +33,7 @@ STATE=${STATE:-/tmp/warp-watchdog}
 CANDS=$STATE/candidates          # latest scan, best first
 BENCH=$STATE/bench               # "ip:port until_epoch"
 STATUS=$STATE/status
+BUSY=/tmp/warp-watchdog.busy      # a by-hand reroll is running: the daemon waits
 
 PROBE_IP=${PROBE_IP:-1.1.1.1}
 WAN_IPS="77.88.8.8 5.255.255.242"
@@ -55,9 +62,15 @@ PATH_EVERY=30
 PATH_FAILS=2
 RECOVER_GAP=600
 TG_API_URL="https://api.telegram.org/bot/getMe"   # answers {"ok":false,...} 404
+# pinned: name lookups bound to the tunnel interface often fail
+TG_API_RESOLVE="api.telegram.org:443:149.154.166.110,149.154.167.220"
 TG_API_SLOW=2.5                  # seconds; normally 0.3-1.4 through WARP
 TG_API_FAILS=2
 AI_URL="https://chatgpt.com/cdn-cgi/trace"
+TRACE_RESOLVE="one.one.one.one:443:1.1.1.1,1.0.0.1"
+RU_COLOS=${RU_COLOS:-"DME LED KJA SVX OVB KZN"}   # Cloudflare's Russian sites
+REROLL_TRIES=4                   # ~10 s each; ZeroBlock starts its own recovery after ~50 s
+REROLL_MAX=4                     # per 10 min
 
 # Used when no scan has run yet: WARP pools and the ports that get through here
 SEED_NETS="162.159.192 162.159.195 188.114.96 188.114.97 188.114.98 188.114.99 8.6.112 8.34.70 8.34.146 8.35.211 8.39.125 8.39.204 8.39.214 8.47.69"
@@ -132,12 +145,84 @@ tg_switch() {
 
 # 0 = valid and fast, 1 = broken or slow, 2 = could not tell (DNS failed)
 tg_api() {
-	b=$(curl -4 -s --interface "$IFACE" -m 5 -w ' %{time_total}' "$TG_API_URL" 2>/dev/null)
+	tg_api_s=""
+	b=$(curl -4 -s --interface "$IFACE" -m 5 --resolve "$TG_API_RESOLVE" -w ' %{time_total}' "$TG_API_URL" 2>/dev/null)
 	rc=$?
 	[ $rc -eq 6 ] && return 2
 	tg_api_s=${b##* }
 	echo "$b" | grep -q '"ok":false' || return 1
 	awk -v t="$tg_api_s" -v m="$TG_API_SLOW" 'BEGIN { exit !(t <= m) }'
+}
+
+# Cloudflare site the tunnel exits from, e.g. HEL; empty if the trace failed
+colo() {
+	curl -4 -s --interface "$IFACE" -m 4 --resolve "$TRACE_RESOLVE" \
+		https://one.one.one.one/cdn-cgi/trace 2>/dev/null | sed -n 's/^colo=//p'
+}
+
+ru_colo() { case " $RU_COLOS " in *" $1 "*) return 0 ;; esac; return 1; }
+
+# wait up to 10 s for the tunnel to come back after a change, print the colo
+wait_colo() {
+	until=$(( $(now) + 10 ))
+	while [ "$(now)" -lt $until ]; do
+		c=$(colo)
+		[ -n "$c" ] && { echo "$c"; return 0; }
+		sleep 1
+	done
+	return 1
+}
+
+# New session without a reboot: a new local port (tries 1-3), then a new endpoint plus a
+# new port (try 4); the peer is re-added each time so a fresh handshake goes out at once.
+# Only the handshake carries AmneziaWG's junk packets: with a bare port change, data
+# leaves the new port as plain WireGuard and DPI cuts it.
+# Done when the exit is not Russian and Telegram answers.
+reroll() {
+	t=$(now)
+	[ $((t - rr_win_start)) -ge $TG_SWITCH_WINDOW ] && { rr_win_start=$t; rr_count=0; }
+	if [ $rr_count -ge $REROLL_MAX ]; then
+		[ "$rr_capped" = 1 ] || log "session: $rr_count re-rolls in 10 min did not help, pausing"
+		rr_capped=1
+		return 1
+	fi
+	rr_capped=0
+	rr_count=$((rr_count + 1))
+	wan_ok || { log "session: internet itself is down, not re-rolling"; return 1; }
+	[ "$DRY_RUN" = 1 ] && { log "dry run: would re-roll the session ($1)"; return 0; }
+	rr_cur=$(endpoint); start=$(now); n=1
+	while [ $n -le $REROLL_TRIES ]; do
+		rr_ep=$rr_cur
+		if [ $n -eq $REROLL_TRIES ]; then
+			rr_ep=$(pick "$rr_cur") || rr_ep=$rr_cur
+		fi
+		if ! ip link show "$IFACE" >/dev/null 2>&1 || iface_settling; then
+			log "session: ZeroBlock is rebuilding $IFACE, leaving it alone"
+			return 1
+		fi
+		awg set "$IFACE" listen-port $(( RANDOM % 25000 + 30000 )) || return 1
+		apply "$rr_ep" || return 1
+		c=$(wait_colo)
+		if [ -z "$c" ]; then
+			why="tunnel did not come back"
+			bench "$rr_ep"
+			[ "$rr_ep" != "$rr_cur" ] && { apply "$rr_cur"; wait_colo >/dev/null; }
+		elif ru_colo "$c"; then
+			why="exits via $c"
+		elif tg_api || tg_api; then
+			if [ "$rr_ep" != "$rr_cur" ]; then persist "$rr_ep"; remember_good "$rr_ep"; fi
+			log "session: re-rolled ($1) -> $rr_ep exits $c, try $n, took $(( $(now) - start ))s"
+			exit_colo=$c
+			return 0
+		else
+			why="exits via $c but api.telegram.org ${tg_api_s:-gave no answer}${tg_api_s:+s}"
+		fi
+		log "session: try $n on $rr_ep: $why"
+		n=$((n + 1))
+	done
+	exit_colo=$c
+	log "session: no foreign exit with working Telegram after $REROLL_TRIES tries, staying on $rr_cur (${c:-no answer})"
+	return 1
 }
 
 # reachable and not seen as Russia (AI services block it)
@@ -351,6 +436,7 @@ write_status() {
 	speed=${sp:-?} B/s
 	telegram: rtt=${tg_ms}ms base=${tg_base}ms loss=$tg_loss/3 misses=$tg_miss slow_rounds=$tg_slow switches_10min=$tg_switches
 	telegram api: ${tg_api_s}s fails=$tg_api_f
+	exit: colo=${exit_colo:-?} rerolls_10min=$rr_count
 	path: ai_misses=$ai_f last_fix=${last_fix:-none}
 	candidates=$(wc -l < "$CANDS") good=$(wc -l < "$GOOD") benched=$(awk -v t="$(now)" '$2 > t' "$BENCH" | wc -l)
 	updated=$(date '+%F %T')
@@ -363,6 +449,7 @@ run() {
 	sleep "${START_DELAY:-120}"
 	fails=0; slow=0; base=0; q_loss=0; q_ms=0; sp=""
 	ai_f=0; last_recover=0; last_fix=""; tg_api_f=0; tg_api_s=0
+	exit_colo=""; rr_count=0; rr_win_start=0; rr_capped=0
 	tg_miss=0; tg_slow=0; tg_base=0; tg_loss=0; tg_ms=0; tg_switches=0; tg_win_start=0; tg_capped=0
 	t=$(now)
 	next_path=$t; next_api=$t; next_q=$t; next_speed=$((t + 300)); next_scan=$((t + 60)); last_better=0
@@ -373,6 +460,10 @@ run() {
 		if [ "$t" -ge "$next_scan" ]; then
 			next_scan=$((t + SCAN_EVERY))
 			scan &
+		fi
+		if [ -f "$BUSY" ] && [ $(( t - $(date -r "$BUSY" +%s) )) -lt 180 ]; then
+			fails=0; tg_miss=0
+			continue
 		fi
 		if ! ip link show "$IFACE" >/dev/null 2>&1 || iface_settling; then
 			fails=0
@@ -434,7 +525,21 @@ run() {
 			fi
 			if [ $tg_api_f -ge $TG_API_FAILS ]; then
 				tg_api_f=0; next_api=$((t + PATH_EVERY))
-				tg_switch "api.telegram.org broken or slow (${tg_api_s}s)" && { write_status; continue; }
+				reroll "api.telegram.org broken or slow (${tg_api_s}s)"
+				tg_miss=0; tg_slow=0; tg_base=0; base=0; slow=0
+				write_status
+				continue
+			fi
+			# same 30 s round: is the exit still abroad?
+			if [ $r -ne 1 ] && [ $tg_api_f -eq 0 ]; then
+				c=$(colo)
+				[ -n "$c" ] && exit_colo=$c
+				if [ -n "$c" ] && ru_colo "$c"; then
+					reroll "exit via $c"
+					tg_base=0; base=0
+					write_status
+					continue
+				fi
 			fi
 		fi
 
@@ -470,6 +575,10 @@ run() {
 case "$1" in
 	run) run ;;
 	scan) scan; cat "$CANDS" ;;
+	reroll) touch "$BUSY"; trap 'rm -f "$BUSY"' EXIT
+		rr_count=0; rr_win_start=0; c=$(colo); echo "exit now: ${c:-?}"
+		reroll "by hand"; echo "exit now: ${exit_colo:-?}" ;;
+	colo) colo ;;
 	status) cat "$STATUS" 2>/dev/null || echo "not running"; logread -e warp-watchdog 2>/dev/null | tail -n 10 ;;
-	*) echo "Usage: $0 run|status|scan"; exit 1 ;;
+	*) echo "Usage: $0 run|status|scan|colo|reroll"; exit 1 ;;
 esac
