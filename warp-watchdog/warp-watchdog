@@ -4,21 +4,21 @@
 # Every 10 s one ping through the tunnel (incoming bytes alone are no proof: replies
 # can keep arriving while our packets are dropped). 3 misses in a row = dead -> switch
 # at once to the next endpoint.
-# Every 60 s a 10-ping quality check (3 bad rounds in a row = slow), every hour a 1 MB speed test: a slow endpoint is
+# Every 60 s a 10-ping quality check (3 bad rounds in a row = slow), every 3 h a 1 MB speed test: a slow endpoint is
 # swapped only for a pre-tested, clearly better one. Endpoints change on the fly
 # (peer re-added, interface stays up) and the working one is saved to UCI.
 # Telegram: every tick a ping to its servers through the tunnel, every 30 s 3 pings for
 # speed. Telegram silent (3 misses) or slow twice in a row while the tunnel is up ->
 # switch endpoint at once, no pre-test; at most 3 such switches per 10 min.
-# Every 30 s a real request to api.telegram.org through the tunnel: pings can pass while
+# Every 60 s a real request to api.telegram.org through the tunnel: pings can pass while
 # Telegram's TCP stalls (files and messages stop loading). No valid answer within
 # 2.5 s twice in a row (re-checked on the next tick) -> new session (see below).
-# Every 30 s the exit colo too (cdn-cgi/trace through the tunnel). Cloudflare picks the
+# Every 60 s the exit colo too (cdn-cgi/trace through the tunnel). Cloudflare picks the
 # exit per session; from a Russian colo (DME = Moscow) Telegram stalls although pings and
 # Cloudflare itself work. The colo sticks to the session's addresses, so moving only the
 # endpoint can keep it - a new local port (and on later tries a new endpoint) re-rolls it,
 # no reboot needed. Each try is verified: foreign colo + api.telegram.org answers.
-# Every 30 s chatgpt.com through ZeroBlock's bootstrap proxy (it goes via Opera).
+# Every 2 min chatgpt.com through ZeroBlock's bootstrap proxy (it goes via Opera).
 # Broken twice in a row while WARP is up -> restart opera-proxy (if it is the one
 # dead) or sing-box; at most once per 10 min.
 #
@@ -42,7 +42,7 @@ DEAD_FAILS=3
 QUALITY_EVERY=60
 SLOW_ROUNDS=3
 SLOW_SWITCH_GAP=300
-SPEED_EVERY=3600
+SPEED_EVERY=10800
 SPEED_MIN=250000                 # bytes/s (2 Mbit/s)
 SPEED_URL="https://speed.cloudflare.com/__down?bytes=1000000"
 SPEED_RESOLVE="speed.cloudflare.com:443:162.159.140.220,172.66.0.218"
@@ -58,7 +58,9 @@ TG_SWITCH_MAX=3
 TG_SWITCH_WINDOW=600
 ZB_PROXY=${ZB_PROXY:-127.0.0.2:19999}        # ZeroBlock's bootstrap proxy, exits via Opera
 OPERA_PROXY=127.0.0.1:18080
-PATH_EVERY=30
+PATH_EVERY=30                    # Telegram ping quality
+API_EVERY=60                     # api.telegram.org + exit colo (~16 KB of TLS each round)
+AI_EVERY=120                     # chatgpt.com via Opera
 PATH_FAILS=2
 RECOVER_GAP=600
 TG_API_URL="https://api.telegram.org/bot/getMe"   # answers {"ok":false,...} 404
@@ -452,7 +454,7 @@ run() {
 	exit_colo=""; rr_count=0; rr_win_start=0; rr_capped=0
 	tg_miss=0; tg_slow=0; tg_base=0; tg_loss=0; tg_ms=0; tg_switches=0; tg_win_start=0; tg_capped=0
 	t=$(now)
-	next_path=$t; next_api=$t; next_q=$t; next_speed=$((t + 300)); next_scan=$((t + 60)); last_better=0
+	next_path=$t; next_ai=$t; next_api=$t; next_q=$t; next_speed=$((t + 300)); next_scan=$((t + 60)); last_better=0
 	while true; do
 		# after a miss, re-check every 3 s so a dead tunnel is confirmed quickly
 		if [ $fails -gt 0 ] || [ $tg_miss -gt 0 ]; then sleep 3; else sleep $TICK; fi
@@ -521,10 +523,10 @@ run() {
 			if [ $r -eq 1 ]; then
 				tg_api_f=$((tg_api_f + 1)); next_api=$t     # re-check on the next tick
 			else
-				tg_api_f=0; next_api=$((t + PATH_EVERY))
+				tg_api_f=0; next_api=$((t + API_EVERY))
 			fi
 			if [ $tg_api_f -ge $TG_API_FAILS ]; then
-				tg_api_f=0; next_api=$((t + PATH_EVERY))
+				tg_api_f=0; next_api=$((t + API_EVERY))
 				reroll "api.telegram.org broken or slow (${tg_api_s}s)"
 				tg_miss=0; tg_slow=0; tg_base=0; base=0; slow=0
 				write_status
@@ -557,7 +559,10 @@ run() {
 			if [ $tg_slow -ge $TG_SLOW_ROUNDS ]; then
 				tg_switch "slow (loss $tg_loss/3, ${tg_ms}ms vs usual ${tg_base}ms)" && { write_status; continue; }
 			fi
-			check_path
+			if [ "$t" -ge "$next_ai" ]; then
+				next_ai=$((t + AI_EVERY))
+				check_path
+			fi
 		fi
 
 		if [ "$t" -ge "$next_speed" ]; then
