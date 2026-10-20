@@ -7,6 +7,9 @@
 # Every 60 s a 10-ping quality check (3 bad rounds in a row = slow), every hour a 1 MB speed test: a slow endpoint is
 # swapped only for a pre-tested, clearly better one. Endpoints change on the fly
 # (peer re-added, interface stays up) and the working one is saved to UCI.
+# Every 30 s the full path too: Telegram and chatgpt.com through ZeroBlock's own proxy,
+# which routes like LAN traffic. Broken twice in a row while WARP is up -> restart
+# opera-proxy (if it is the one dead) or sing-box; at most once per 10 min.
 #
 # Usage: warp-watchdog run | status | scan        DRY_RUN=1 logs decisions only.
 
@@ -34,6 +37,14 @@ SCAN_EVERY=21600
 BENCH_SECS=1800
 MAX_TRIES=8
 DRY_RUN=${DRY_RUN:-0}
+
+ZB_PROXY=${ZB_PROXY:-127.0.0.2:19999}        # ZeroBlock's proxy: same routing rules as the LAN
+OPERA_PROXY=127.0.0.1:18080
+PATH_EVERY=30
+PATH_FAILS=2
+RECOVER_GAP=600
+TG_URL="https://web.telegram.org/"
+AI_URL="https://chatgpt.com/cdn-cgi/trace"
 
 # Used when no scan has run yet: WARP pools and the ports that get through here
 SEED_NETS="162.159.192 162.159.195 188.114.96 188.114.97 188.114.98 188.114.99 8.6.112 8.34.70 8.34.146 8.35.211 8.39.125 8.39.204 8.39.214 8.47.69"
@@ -74,6 +85,48 @@ quality() {
 speed() {
 	curl -4 -s --interface "$IFACE" -m 20 --resolve "$SPEED_RESOLVE" -o /dev/null \
 		-w '%{speed_download}' "$SPEED_URL" 2>/dev/null | cut -d. -f1
+}
+
+tg_ok() {
+	c=$(curl -s -m 8 -x "http://$ZB_PROXY" -o /dev/null -w '%{http_code}' "$TG_URL" 2>/dev/null)
+	[ -n "$c" ] && [ "$c" != 000 ]
+}
+
+# reachable and not seen as Russia (AI services block it)
+ai_ok() {
+	b=$(curl -s -m 8 -x "http://$ZB_PROXY" "$AI_URL" 2>/dev/null)
+	echo "$b" | grep -q '^loc=' && ! echo "$b" | grep -q '^loc=RU'
+}
+
+opera_ok() {
+	c=$(curl -s -m 8 -x "http://$OPERA_PROXY" -o /dev/null -w '%{http_code}' https://www.google.com/ 2>/dev/null)
+	[ -n "$c" ] && [ "$c" != 000 ]
+}
+
+check_path() {
+	if tg_ok; then tg_f=0; else tg_f=$((tg_f + 1)); fi
+	if ai_ok; then ai_f=0; else ai_f=$((ai_f + 1)); fi
+	[ $tg_f -eq 0 ] && [ $ai_f -eq 0 ] && last_fix=""
+	[ $tg_f -ge $PATH_FAILS ] || [ $ai_f -ge $PATH_FAILS ] || return 0
+	# a dead tunnel is the WARP part's job
+	[ $fails -eq 0 ] || return 0
+	[ $(( $(now) - last_recover )) -ge $RECOVER_GAP ] || return 0
+	wan_ok || { log "path: internet itself is down, not restarting"; return 0; }
+	last_recover=$(now)
+	# Opera restart first when only AI fails and the proxy itself is dead; if that
+	# did not help last time, go straight to sing-box
+	if [ $tg_f -lt $PATH_FAILS ] && [ "$last_fix" != opera ] && ! opera_ok; then
+		[ "$DRY_RUN" = 1 ] && log "dry run: would restart opera-proxy"
+		log "path: AI unreachable, Opera proxy dead - restarting opera-proxy"
+		[ "$DRY_RUN" = 1 ] || /etc/init.d/opera-proxy restart
+		last_fix=opera
+	else
+		[ "$DRY_RUN" = 1 ] && log "dry run: would restart sing-box"
+		log "path: broken (telegram misses $tg_f, AI misses $ai_f) while WARP is up - restarting sing-box"
+		[ "$DRY_RUN" = 1 ] || ubus call zeroblock restart_singbox >/dev/null 2>&1
+		last_fix=singbox
+	fi
+	tg_f=0; ai_f=0
 }
 
 benched() {
@@ -249,6 +302,7 @@ write_status() {
 	fails=$fails
 	loss=$q_loss/10 rtt=${q_ms}ms base=${base}ms slow_rounds=$slow
 	speed=${sp:-?} B/s
+	path: telegram_misses=$tg_f ai_misses=$ai_f last_fix=${last_fix:-none}
 	candidates=$(wc -l < "$CANDS") good=$(wc -l < "$GOOD") benched=$(awk -v t="$(now)" '$2 > t' "$BENCH" | wc -l)
 	updated=$(date '+%F %T')
 	EOF
@@ -259,8 +313,9 @@ run() {
 	# let ZeroBlock finish its own start-up work on the tunnel first
 	sleep "${START_DELAY:-120}"
 	fails=0; slow=0; base=0; q_loss=0; q_ms=0; sp=""
+	tg_f=0; ai_f=0; last_recover=0; last_fix=""
 	t=$(now)
-	next_q=$t; next_speed=$((t + 300)); next_scan=$((t + 60)); last_better=0
+	next_path=$t; next_q=$t; next_speed=$((t + 300)); next_scan=$((t + 60)); last_better=0
 	while true; do
 		# after a miss, re-check every 3 s so a dead tunnel is confirmed quickly
 		if [ $fails -gt 0 ]; then sleep 3; else sleep $TICK; fi
@@ -311,6 +366,11 @@ run() {
 				switch_better "loss $q_loss/10, ${q_ms}ms vs usual ${base}ms" "$cmp_ms" && base=0
 				slow=0
 			fi
+		fi
+
+		if [ "$t" -ge "$next_path" ]; then
+			next_path=$((t + PATH_EVERY))
+			check_path
 		fi
 
 		if [ "$t" -ge "$next_speed" ]; then
