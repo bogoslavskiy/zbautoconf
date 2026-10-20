@@ -10,9 +10,12 @@
 # Telegram: every tick a ping to its servers through the tunnel, every 30 s 3 pings for
 # speed. Telegram silent (3 misses) or slow twice in a row while the tunnel is up ->
 # switch endpoint at once, no pre-test; at most 3 such switches per 10 min.
-# Every 30 s the full path too: Telegram and chatgpt.com through ZeroBlock's own proxy,
-# which routes like LAN traffic. Broken twice in a row while WARP is up -> restart
-# opera-proxy (if it is the one dead) or sing-box; at most once per 10 min.
+# Every 30 s a real request to api.telegram.org through the tunnel: pings can pass while
+# Telegram's TCP stalls (files and messages stop loading). No valid answer within
+# 2.5 s twice in a row (re-checked on the next tick) -> switch endpoint, same limit.
+# Every 30 s chatgpt.com through ZeroBlock's bootstrap proxy (it goes via Opera).
+# Broken twice in a row while WARP is up -> restart opera-proxy (if it is the one
+# dead) or sing-box; at most once per 10 min.
 #
 # Usage: warp-watchdog run | status | scan        DRY_RUN=1 logs decisions only.
 
@@ -46,12 +49,14 @@ TG_MISSES=3
 TG_SLOW_ROUNDS=2
 TG_SWITCH_MAX=3
 TG_SWITCH_WINDOW=600
-ZB_PROXY=${ZB_PROXY:-127.0.0.2:19999}        # ZeroBlock's proxy: same routing rules as the LAN
+ZB_PROXY=${ZB_PROXY:-127.0.0.2:19999}        # ZeroBlock's bootstrap proxy, exits via Opera
 OPERA_PROXY=127.0.0.1:18080
 PATH_EVERY=30
 PATH_FAILS=2
 RECOVER_GAP=600
-TG_URL="https://web.telegram.org/"
+TG_API_URL="https://api.telegram.org/bot/getMe"   # answers {"ok":false,...} 404
+TG_API_SLOW=2.5                  # seconds; normally 0.3-1.4 through WARP
+TG_API_FAILS=2
 AI_URL="https://chatgpt.com/cdn-cgi/trace"
 
 # Used when no scan has run yet: WARP pools and the ports that get through here
@@ -125,9 +130,14 @@ tg_switch() {
 	tg_miss=0; tg_slow=0; tg_base=0; base=0; slow=0
 }
 
-tg_ok() {
-	c=$(curl -s -m 8 -x "http://$ZB_PROXY" -o /dev/null -w '%{http_code}' "$TG_URL" 2>/dev/null)
-	[ -n "$c" ] && [ "$c" != 000 ]
+# 0 = valid and fast, 1 = broken or slow, 2 = could not tell (DNS failed)
+tg_api() {
+	b=$(curl -4 -s --interface "$IFACE" -m 5 -w ' %{time_total}' "$TG_API_URL" 2>/dev/null)
+	rc=$?
+	[ $rc -eq 6 ] && return 2
+	tg_api_s=${b##* }
+	echo "$b" | grep -q '"ok":false' || return 1
+	awk -v t="$tg_api_s" -v m="$TG_API_SLOW" 'BEGIN { exit !(t <= m) }'
 }
 
 # reachable and not seen as Russia (AI services block it)
@@ -142,29 +152,28 @@ opera_ok() {
 }
 
 check_path() {
-	if tg_ok; then tg_f=0; else tg_f=$((tg_f + 1)); fi
 	if ai_ok; then ai_f=0; else ai_f=$((ai_f + 1)); fi
-	[ $tg_f -eq 0 ] && [ $ai_f -eq 0 ] && last_fix=""
-	[ $tg_f -ge $PATH_FAILS ] || [ $ai_f -ge $PATH_FAILS ] || return 0
+	[ $ai_f -eq 0 ] && last_fix=""
+	[ $ai_f -ge $PATH_FAILS ] || return 0
 	# a dead tunnel is the WARP part's job
 	[ $fails -eq 0 ] || return 0
 	[ $(( $(now) - last_recover )) -ge $RECOVER_GAP ] || return 0
 	wan_ok || { log "path: internet itself is down, not restarting"; return 0; }
 	last_recover=$(now)
-	# Opera restart first when only AI fails and the proxy itself is dead; if that
-	# did not help last time, go straight to sing-box
-	if [ $tg_f -lt $PATH_FAILS ] && [ "$last_fix" != opera ] && ! opera_ok; then
+	# Opera restart first when the proxy itself is dead; if that did not help
+	# last time, go straight to sing-box
+	if [ "$last_fix" != opera ] && ! opera_ok; then
 		[ "$DRY_RUN" = 1 ] && log "dry run: would restart opera-proxy"
 		log "path: AI unreachable, Opera proxy dead - restarting opera-proxy"
 		[ "$DRY_RUN" = 1 ] || /etc/init.d/opera-proxy restart
 		last_fix=opera
 	else
 		[ "$DRY_RUN" = 1 ] && log "dry run: would restart sing-box"
-		log "path: broken (telegram misses $tg_f, AI misses $ai_f) while WARP is up - restarting sing-box"
+		log "path: AI unreachable ($ai_f misses) while WARP is up - restarting sing-box"
 		[ "$DRY_RUN" = 1 ] || ubus call zeroblock restart_singbox >/dev/null 2>&1
 		last_fix=singbox
 	fi
-	tg_f=0; ai_f=0
+	ai_f=0
 }
 
 benched() {
@@ -341,7 +350,8 @@ write_status() {
 	loss=$q_loss/10 rtt=${q_ms}ms base=${base}ms slow_rounds=$slow
 	speed=${sp:-?} B/s
 	telegram: rtt=${tg_ms}ms base=${tg_base}ms loss=$tg_loss/3 misses=$tg_miss slow_rounds=$tg_slow switches_10min=$tg_switches
-	path: telegram_misses=$tg_f ai_misses=$ai_f last_fix=${last_fix:-none}
+	telegram api: ${tg_api_s}s fails=$tg_api_f
+	path: ai_misses=$ai_f last_fix=${last_fix:-none}
 	candidates=$(wc -l < "$CANDS") good=$(wc -l < "$GOOD") benched=$(awk -v t="$(now)" '$2 > t' "$BENCH" | wc -l)
 	updated=$(date '+%F %T')
 	EOF
@@ -352,10 +362,10 @@ run() {
 	# let ZeroBlock finish its own start-up work on the tunnel first
 	sleep "${START_DELAY:-120}"
 	fails=0; slow=0; base=0; q_loss=0; q_ms=0; sp=""
-	tg_f=0; ai_f=0; last_recover=0; last_fix=""
+	ai_f=0; last_recover=0; last_fix=""; tg_api_f=0; tg_api_s=0
 	tg_miss=0; tg_slow=0; tg_base=0; tg_loss=0; tg_ms=0; tg_switches=0; tg_win_start=0; tg_capped=0
 	t=$(now)
-	next_path=$t; next_q=$t; next_speed=$((t + 300)); next_scan=$((t + 60)); last_better=0
+	next_path=$t; next_api=$t; next_q=$t; next_speed=$((t + 300)); next_scan=$((t + 60)); last_better=0
 	while true; do
 		# after a miss, re-check every 3 s so a dead tunnel is confirmed quickly
 		if [ $fails -gt 0 ] || [ $tg_miss -gt 0 ]; then sleep 3; else sleep $TICK; fi
@@ -413,6 +423,19 @@ run() {
 			tg_switch "no ping for $tg_miss checks"
 			write_status
 			continue
+		fi
+
+		if [ "$t" -ge "$next_api" ]; then
+			tg_api; r=$?
+			if [ $r -eq 1 ]; then
+				tg_api_f=$((tg_api_f + 1)); next_api=$t     # re-check on the next tick
+			else
+				tg_api_f=0; next_api=$((t + PATH_EVERY))
+			fi
+			if [ $tg_api_f -ge $TG_API_FAILS ]; then
+				tg_api_f=0; next_api=$((t + PATH_EVERY))
+				tg_switch "api.telegram.org broken or slow (${tg_api_s}s)" && { write_status; continue; }
+			fi
 		fi
 
 		if [ "$t" -ge "$next_path" ]; then
