@@ -153,8 +153,19 @@ install_rrws() {
 }
 
 install_warp_watchdog() {
-    # Устанавливаем WARP watchdog
-	sh <(wget -qO- https://raw.githubusercontent.com/bogoslavskiy/zbautoconf/refs/heads/main/warp_watchdog.sh) noclear
+    # Устанавливаем WARP watchdog: он сам меняет адрес/узел WARP, когда Telegram и др. ломаются.
+    # Вторая попытка - если GitHub или сеть моргнули при первой
+	for try in 1 2; do
+		sh <(wget -qO- https://raw.githubusercontent.com/bogoslavskiy/zbautoconf/refs/heads/main/warp_watchdog.sh) noclear
+		/etc/init.d/warp-watchdog enabled 2>/dev/null && /etc/init.d/warp-watchdog running 2>/dev/null && break
+		sleep 5
+	done
+	if /etc/init.d/warp-watchdog enabled 2>/dev/null && /etc/init.d/warp-watchdog running 2>/dev/null; then
+		echo -e "${GREEN}✓ WARP watchdog установлен и включён в автозапуск${CLR_OFF}"
+	else
+		echo -e "${RED_BRIGHT}✗ WARP watchdog НЕ установился. После перезагрузки запустите вручную:${CLR_OFF}"
+		echo "sh <(wget -qO- https://raw.githubusercontent.com/bogoslavskiy/zbautoconf/refs/heads/main/warp_watchdog.sh)"
+	fi
     echo ""
 }
 
@@ -346,7 +357,7 @@ config settings 'settings'
 	option subscription_ua_migrated_v2 '1'
 	option subscription_update_interval 'off'
 	option whitelist_bootstrap_max_attempts '10'
-	option health_opera '1'
+	option health_opera '0'
 	option whitelist_bootstrap_dns_server '77.88.8.8'
 	option whitelist_bootstrap_dns_via_whitelist '0'
 	option dns_recovery_enabled '1'
