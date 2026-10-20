@@ -7,6 +7,9 @@
 # Every 60 s a 10-ping quality check (3 bad rounds in a row = slow), every hour a 1 MB speed test: a slow endpoint is
 # swapped only for a pre-tested, clearly better one. Endpoints change on the fly
 # (peer re-added, interface stays up) and the working one is saved to UCI.
+# Telegram: every tick a ping to its servers through the tunnel, every 30 s 3 pings for
+# speed. Telegram silent (3 misses) or slow twice in a row while the tunnel is up ->
+# switch endpoint at once, no pre-test; at most 3 such switches per 10 min.
 # Every 30 s the full path too: Telegram and chatgpt.com through ZeroBlock's own proxy,
 # which routes like LAN traffic. Broken twice in a row while WARP is up -> restart
 # opera-proxy (if it is the one dead) or sing-box; at most once per 10 min.
@@ -38,6 +41,11 @@ BENCH_SECS=1800
 MAX_TRIES=8
 DRY_RUN=${DRY_RUN:-0}
 
+TG_IPS=${TG_IPS:-"149.154.167.51 149.154.167.91"}   # DC2, DC4 (Amsterdam), ~55 ms through WARP
+TG_MISSES=3
+TG_SLOW_ROUNDS=2
+TG_SWITCH_MAX=3
+TG_SWITCH_WINDOW=600
 ZB_PROXY=${ZB_PROXY:-127.0.0.2:19999}        # ZeroBlock's proxy: same routing rules as the LAN
 OPERA_PROXY=127.0.0.1:18080
 PATH_EVERY=30
@@ -85,6 +93,36 @@ quality() {
 speed() {
 	curl -4 -s --interface "$IFACE" -m 20 --resolve "$SPEED_RESOLVE" -o /dev/null \
 		-w '%{speed_download}' "$SPEED_URL" 2>/dev/null | cut -d. -f1
+}
+
+tg_ping() {
+	for ip in $TG_IPS; do ping -c1 -W1 -I "$IFACE" "$ip" >/dev/null 2>&1 && return 0; done
+	return 1
+}
+
+# "loss_of_3 avg_ms" to the first Telegram DC
+tg_quality() {
+	set -- $TG_IPS
+	ping -c3 -W1 -I "$IFACE" "$1" 2>/dev/null | awk '
+		/packets transmitted/ { loss = $1 - $4 }
+		/round-trip/ { split($4, a, "/"); avg = int(a[2] + 0.5) }
+		END { if (loss == "") loss = 3; if (avg == "") avg = 0; print loss, avg }'
+}
+
+# Switch because of Telegram, rate-limited so an outage on Telegram's side
+# does not burn through the whole endpoint list
+tg_switch() {
+	t=$(now)
+	[ $((t - tg_win_start)) -ge $TG_SWITCH_WINDOW ] && { tg_win_start=$t; tg_switches=0; }
+	if [ $tg_switches -ge $TG_SWITCH_MAX ]; then
+		[ "$tg_capped" = 1 ] || log "telegram: $tg_switches switches in 10 min did not help, pausing switches"
+		tg_capped=1
+		return 1
+	fi
+	tg_capped=0
+	tg_switches=$((tg_switches + 1))
+	switch_dead "telegram: $1"
+	tg_miss=0; tg_slow=0; tg_base=0; base=0; slow=0
 }
 
 tg_ok() {
@@ -302,6 +340,7 @@ write_status() {
 	fails=$fails
 	loss=$q_loss/10 rtt=${q_ms}ms base=${base}ms slow_rounds=$slow
 	speed=${sp:-?} B/s
+	telegram: rtt=${tg_ms}ms base=${tg_base}ms loss=$tg_loss/3 misses=$tg_miss slow_rounds=$tg_slow switches_10min=$tg_switches
 	path: telegram_misses=$tg_f ai_misses=$ai_f last_fix=${last_fix:-none}
 	candidates=$(wc -l < "$CANDS") good=$(wc -l < "$GOOD") benched=$(awk -v t="$(now)" '$2 > t' "$BENCH" | wc -l)
 	updated=$(date '+%F %T')
@@ -314,11 +353,12 @@ run() {
 	sleep "${START_DELAY:-120}"
 	fails=0; slow=0; base=0; q_loss=0; q_ms=0; sp=""
 	tg_f=0; ai_f=0; last_recover=0; last_fix=""
+	tg_miss=0; tg_slow=0; tg_base=0; tg_loss=0; tg_ms=0; tg_switches=0; tg_win_start=0; tg_capped=0
 	t=$(now)
 	next_path=$t; next_q=$t; next_speed=$((t + 300)); next_scan=$((t + 60)); last_better=0
 	while true; do
 		# after a miss, re-check every 3 s so a dead tunnel is confirmed quickly
-		if [ $fails -gt 0 ]; then sleep 3; else sleep $TICK; fi
+		if [ $fails -gt 0 ] || [ $tg_miss -gt 0 ]; then sleep 3; else sleep $TICK; fi
 		t=$(now)
 		if [ "$t" -ge "$next_scan" ]; then
 			next_scan=$((t + SCAN_EVERY))
@@ -368,8 +408,27 @@ run() {
 			fi
 		fi
 
+		if tg_ping; then tg_miss=0; else tg_miss=$((tg_miss + 1)); fi
+		if [ $tg_miss -ge $TG_MISSES ]; then
+			tg_switch "no ping for $tg_miss checks"
+			write_status
+			continue
+		fi
+
 		if [ "$t" -ge "$next_path" ]; then
 			next_path=$((t + PATH_EVERY))
+			set -- $(tg_quality); tg_loss=$1; tg_ms=$2
+			if [ "$tg_loss" -lt 3 ]; then
+				[ "$tg_base" -eq 0 ] || [ "$tg_ms" -lt "$tg_base" ] && tg_base=$tg_ms
+			fi
+			if [ "$tg_loss" -ge 2 ] || { [ "$tg_ms" -gt $((tg_base * 3)) ] && [ "$tg_ms" -gt $((tg_base + 150)) ]; }; then
+				tg_slow=$((tg_slow + 1))
+			else
+				tg_slow=0
+			fi
+			if [ $tg_slow -ge $TG_SLOW_ROUNDS ]; then
+				tg_switch "slow (loss $tg_loss/3, ${tg_ms}ms vs usual ${tg_base}ms)" && { write_status; continue; }
+			fi
 			check_path
 		fi
 
