@@ -4,7 +4,7 @@
 # Every 10 s one ping through the tunnel (incoming bytes alone are no proof: replies
 # can keep arriving while our packets are dropped). 3 misses in a row = dead -> switch
 # at once to the next endpoint.
-# Every 60 s a 5-ping quality check, every hour a 1 MB speed test: a slow endpoint is
+# Every 60 s a 10-ping quality check (3 bad rounds in a row = slow), every hour a 1 MB speed test: a slow endpoint is
 # swapped only for a pre-tested, clearly better one. Endpoints change on the fly
 # (peer re-added, interface stays up) and the working one is saved to UCI.
 #
@@ -24,7 +24,7 @@ WAN_IPS="77.88.8.8 5.255.255.242"
 TICK=10
 DEAD_FAILS=3
 QUALITY_EVERY=60
-SLOW_ROUNDS=2
+SLOW_ROUNDS=3
 SLOW_SWITCH_GAP=300
 SPEED_EVERY=3600
 SPEED_MIN=250000                 # bytes/s (2 Mbit/s)
@@ -63,12 +63,12 @@ iface_settling() {
 	[ -z "$up" ] || [ "$up" -lt 60 ]
 }
 
-# "loss_of_5 avg_ms"
+# "loss_of_10 avg_ms"
 quality() {
-	ping -c5 -W1 -I "$IFACE" "$PROBE_IP" 2>/dev/null | awk '
+	ping -c10 -W1 -I "$IFACE" "$PROBE_IP" 2>/dev/null | awk '
 		/packets transmitted/ { loss = $1 - $4 }
 		/round-trip/ { split($4, a, "/"); avg = int(a[2] + 0.5) }
-		END { if (loss == "") loss = 5; if (avg == "") avg = 0; print loss, avg }'
+		END { if (loss == "") loss = 10; if (avg == "") avg = 0; print loss, avg }'
 }
 
 speed() {
@@ -208,6 +208,8 @@ switch_better() {
 	if verify "$ep" "$t0"; then
 		persist "$ep"
 		remember_good "$ep"
+		# do not hop straight back to the endpoint we just left
+		bench "$cur"
 		log "switched $cur -> $ep ($1; ${cur_ms}ms -> ${new_ms}ms)"
 		return 0
 	fi
@@ -245,7 +247,7 @@ write_status() {
 	endpoint=$(endpoint)
 	handshake=$(h=$(hs); [ "${h:-0}" -gt 0 ] && echo "$(( $(now) - h ))s ago" || echo none)
 	fails=$fails
-	loss=$q_loss/5 rtt=${q_ms}ms base=${base}ms slow_rounds=$slow
+	loss=$q_loss/10 rtt=${q_ms}ms base=${base}ms slow_rounds=$slow
 	speed=${sp:-?} B/s
 	candidates=$(wc -l < "$CANDS") good=$(wc -l < "$GOOD") benched=$(awk -v t="$(now)" '$2 > t' "$BENCH" | wc -l)
 	updated=$(date '+%F %T')
@@ -294,9 +296,9 @@ run() {
 		if [ "$t" -ge "$next_q" ]; then
 			next_q=$((t + QUALITY_EVERY))
 			set -- $(quality); q_loss=$1; q_ms=$2
-			if [ "$q_loss" -lt 5 ]; then
+			if [ "$q_loss" -lt 10 ]; then
 				[ "$base" -eq 0 ] || [ "$q_ms" -lt "$base" ] && base=$q_ms
-				if [ "$q_loss" -ge 2 ] || { [ "$q_ms" -gt $((base * 3)) ] && [ "$q_ms" -gt $((base + 50)) ]; }; then
+				if [ "$q_loss" -ge 3 ] || { [ "$q_ms" -gt $((base * 3)) ] && [ "$q_ms" -gt $((base + 50)) ]; }; then
 					slow=$((slow + 1))
 				else
 					slow=0
@@ -305,8 +307,8 @@ run() {
 			if [ $slow -ge $SLOW_ROUNDS ] && [ $((t - last_better)) -ge $SLOW_SWITCH_GAP ]; then
 				last_better=$t
 				# with packet loss any pre-tested endpoint is better; otherwise it must be faster
-				[ "$q_loss" -ge 2 ] && cmp_ms=0 || cmp_ms=$q_ms
-				switch_better "loss $q_loss/5, ${q_ms}ms vs usual ${base}ms" "$cmp_ms" && base=0
+				[ "$q_loss" -ge 3 ] && cmp_ms=0 || cmp_ms=$q_ms
+				switch_better "loss $q_loss/10, ${q_ms}ms vs usual ${base}ms" "$cmp_ms" && base=0
 				slow=0
 			fi
 		fi
