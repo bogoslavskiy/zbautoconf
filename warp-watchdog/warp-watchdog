@@ -22,8 +22,9 @@
 # no reboot needed. Each try is verified: foreign colo + api.telegram.org answers.
 # Every 2 min chatgpt.com through ZeroBlock's bootstrap proxy (it goes via Opera).
 # Broken twice in a row while WARP is up -> restart opera-proxy (if it is the one
-# dead) or sing-box; at most once per 10 min. Opera itself is checked every 30 s on its
-# own: it hangs when the provider stalls its server, 2 misses -> restart (90 s apart).
+# dead) or sing-box; at most once per 10 min. Opera itself is checked every 15 s on its
+# own and reaches Opera through WARP (the provider stalls Opera's network): 2 misses ->
+# restart (60 s apart), and if that did not help the other path, direct or WARP.
 #
 # Usage: warp-watchdog run | status | scan | colo | reroll   DRY_RUN=1 logs decisions only.
 # reroll = get a new session (new exit colo) by hand, no reboot.
@@ -68,7 +69,13 @@ AI_EVERY=120                     # chatgpt.com via Opera
 PATH_FAILS=2
 RECOVER_GAP=600
 OPERA_FAILS=2                    # opera-proxy hangs when the provider stalls its server: restart fast
-OPERA_GAP=90
+OPERA_GAP=60
+OPERA_EVERY=15
+# The provider stalls Opera's API and most of its servers (AS205016) while they answer
+# through WARP in 0.04-0.4 s: the router's own connections there go through awg10.
+# Only locally generated traffic (iif lo), LAN clients are not touched.
+OPERA_NETS="77.111.240.0/20"
+OPERA_TABLE=1205
 TG_API_URL="https://api.telegram.org/bot/getMe"   # answers {"ok":false,...} 404
 # pinned: name lookups bound to the tunnel interface often fail
 TG_API_RESOLVE="api.telegram.org:443:149.154.166.110,149.154.167.220"
@@ -255,15 +262,44 @@ opera_ok() {
 	[ -n "$c" ] && [ "$c" != 000 ]
 }
 
-# checked on its own every 30 s: a hung opera-proxy otherwise waits for the AI check and its 10 min gap
+# $1 = warp | direct: how opera-proxy reaches Opera. With awg10 gone (ZeroBlock rebuilds
+# it) the table is empty and the lookup falls through to the main table, i.e. direct.
+opera_route() {
+	[ "$DRY_RUN" = 1 ] && return 0
+	if [ "$1" = warp ]; then
+		ip route show table $OPERA_TABLE 2>/dev/null | grep -q "dev $IFACE" ||
+			ip route replace default dev "$IFACE" table $OPERA_TABLE 2>/dev/null
+		if [ -z "$(ip rule show pref $OPERA_TABLE 2>/dev/null)" ]; then
+			for n in $OPERA_NETS; do ip rule add pref $OPERA_TABLE iif lo to "$n" lookup $OPERA_TABLE; done
+		fi
+	else
+		while ip rule del pref $OPERA_TABLE 2>/dev/null; do :; done
+	fi
+}
+
+# Every 15 s on its own. Through WARP while the tunnel is up; 2 misses -> restart
+# opera-proxy (it logs in again and picks the fastest server); if that did not help,
+# the other path (direct / WARP) with the next restart.
 check_opera() {
-	if opera_ok; then op_f=0; return 0; fi
+	[ $fails -eq 0 ] && want=warp || want=direct
+	[ "$op_forced" = 1 ] || op_path=$want
+	opera_route "$op_path"
+	if opera_ok; then
+		[ $op_f -gt 0 ] || [ $op_restarts -gt 0 ] && log "opera: answers again (via $op_path)"
+		op_f=0; op_restarts=0; op_forced=0
+		return 0
+	fi
 	op_f=$((op_f + 1))
 	[ $op_f -ge $OPERA_FAILS ] || return 0
 	[ $(( $(now) - last_opera )) -ge $OPERA_GAP ] || return 0
 	wan_ok || return 0
-	last_opera=$(now); op_f=0
-	log "opera: proxy does not answer - restarting opera-proxy"
+	if [ $op_restarts -ge 1 ]; then
+		[ "$op_path" = warp ] && op_path=direct || op_path=warp
+		op_forced=1
+		opera_route "$op_path"
+	fi
+	last_opera=$(now); op_f=0; op_restarts=$((op_restarts + 1))
+	log "opera: proxy does not answer - restarting opera-proxy (via $op_path)"
 	[ "$DRY_RUN" = 1 ] || /etc/init.d/opera-proxy restart
 }
 
@@ -490,7 +526,7 @@ write_status() {
 	telegram: rtt=${tg_ms}ms base=${tg_base}ms loss=$tg_loss/3 misses=$tg_miss slow_rounds=$tg_slow switches_10min=$tg_switches
 	telegram api: ${tg_api_s}s fails=$tg_api_f
 	exit: colo=${exit_colo:-?} rerolls_10min=$rr_count
-	path: ai_misses=$ai_f last_fix=${last_fix:-none} opera_misses=$op_f
+	path: ai_misses=$ai_f last_fix=${last_fix:-none} opera_misses=$op_f opera_via=$op_path opera_restarts=$op_restarts
 	ru_nets: $(awk -v t="$(now)" '$2 > t { printf "%s ", $1 }' "$RU_NETS")
 	candidates=$(wc -l < "$CANDS") good=$(wc -l < "$GOOD") benched=$(awk -v t="$(now)" '$2 > t' "$BENCH" | wc -l)
 	updated=$(date '+%F %T')
@@ -502,11 +538,11 @@ run() {
 	# let ZeroBlock finish its own start-up work on the tunnel first
 	sleep "${START_DELAY:-120}"
 	fails=0; slow=0; base=0; q_loss=0; q_ms=0; sp=""
-	ai_f=0; last_recover=0; last_fix=""; tg_api_f=0; tg_api_s=0; op_f=0; last_opera=0
+	ai_f=0; last_recover=0; last_fix=""; tg_api_f=0; tg_api_s=0; op_f=0; last_opera=0; op_restarts=0; op_forced=0; op_path=warp
 	exit_colo=""; rr_count=0; rr_win_start=0; rr_capped=0
 	tg_miss=0; tg_slow=0; tg_base=0; tg_loss=0; tg_ms=0; tg_switches=0; tg_win_start=0; tg_capped=0
 	t=$(now)
-	next_path=$t; next_ai=$t; next_api=$t; next_q=$t; next_speed=$((t + 300)); next_scan=$((t + 60)); last_better=0
+	next_path=$t; next_opera=$t; next_ai=$t; next_api=$t; next_q=$t; next_speed=$((t + 300)); next_scan=$((t + 60)); last_better=0
 	while true; do
 		# after a miss, re-check every 3 s so a dead tunnel is confirmed quickly
 		if [ $fails -gt 0 ] || [ $tg_miss -gt 0 ]; then sleep 3; else sleep $TICK; fi
@@ -598,6 +634,11 @@ run() {
 			fi
 		fi
 
+		if [ "$t" -ge "$next_opera" ]; then
+			next_opera=$((t + OPERA_EVERY))
+			check_opera
+		fi
+
 		if [ "$t" -ge "$next_path" ]; then
 			next_path=$((t + PATH_EVERY))
 			set -- $(tg_quality); tg_loss=$1; tg_ms=$2
@@ -612,7 +653,6 @@ run() {
 			if [ $tg_slow -ge $TG_SLOW_ROUNDS ]; then
 				tg_switch "slow (loss $tg_loss/3, ${tg_ms}ms vs usual ${tg_base}ms)" && { write_status; continue; }
 			fi
-			check_opera
 			if [ "$t" -ge "$next_ai" ]; then
 				next_ai=$((t + AI_EVERY))
 				check_path
