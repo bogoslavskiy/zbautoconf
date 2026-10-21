@@ -15,12 +15,15 @@
 # 2.5 s twice in a row (re-checked on the next tick) -> new session (see below).
 # Every 60 s the exit colo too (cdn-cgi/trace through the tunnel). Cloudflare picks the
 # exit per session; from a Russian colo (DME = Moscow) Telegram stalls although pings and
-# Cloudflare itself work. The colo sticks to the session's addresses, so moving only the
+# Cloudflare itself work. Which colo also depends on the endpoint's /24 (the provider routes
+# some Cloudflare ranges to Moscow): a /24 that exited via Russia is tried last for 3 h.
+# The colo sticks to the session's addresses, so moving only the
 # endpoint can keep it - a new local port (and on later tries a new endpoint) re-rolls it,
 # no reboot needed. Each try is verified: foreign colo + api.telegram.org answers.
 # Every 2 min chatgpt.com through ZeroBlock's bootstrap proxy (it goes via Opera).
 # Broken twice in a row while WARP is up -> restart opera-proxy (if it is the one
-# dead) or sing-box; at most once per 10 min.
+# dead) or sing-box; at most once per 10 min. Opera itself is checked every 30 s on its
+# own: it hangs when the provider stalls its server, 2 misses -> restart (90 s apart).
 #
 # Usage: warp-watchdog run | status | scan | colo | reroll   DRY_RUN=1 logs decisions only.
 # reroll = get a new session (new exit colo) by hand, no reboot.
@@ -32,6 +35,7 @@ GOOD=$CONF_DIR/good              # endpoints that worked here, newest first
 STATE=${STATE:-/tmp/warp-watchdog}
 CANDS=$STATE/candidates          # latest scan, best first
 BENCH=$STATE/bench               # "ip:port until_epoch"
+RU_NETS=$STATE/ru_nets           # "a.b.c until_epoch": /24s that just exited via a Russian colo
 STATUS=$STATE/status
 BUSY=/tmp/warp-watchdog.busy      # a by-hand reroll is running: the daemon waits
 
@@ -63,6 +67,8 @@ API_EVERY=60                     # api.telegram.org + exit colo (~16 KB of TLS e
 AI_EVERY=120                     # chatgpt.com via Opera
 PATH_FAILS=2
 RECOVER_GAP=600
+OPERA_FAILS=2                    # opera-proxy hangs when the provider stalls its server: restart fast
+OPERA_GAP=90
 TG_API_URL="https://api.telegram.org/bot/getMe"   # answers {"ok":false,...} 404
 # pinned: name lookups bound to the tunnel interface often fail
 TG_API_RESOLVE="api.telegram.org:443:149.154.166.110,149.154.167.220"
@@ -73,13 +79,17 @@ TRACE_RESOLVE="one.one.one.one:443:1.1.1.1,1.0.0.1"
 RU_COLOS=${RU_COLOS:-"DME LED KJA SVX OVB KZN"}   # Cloudflare's Russian sites
 REROLL_TRIES=4                   # ~10 s each; ZeroBlock starts its own recovery after ~50 s
 REROLL_MAX=4                     # per 10 min
+RU_NET_SECS=10800                # how long a /24 that exited via Russia is tried last
 
-# Used when no scan has run yet: WARP pools and the ports that get through here
-SEED_NETS="162.159.192 162.159.195 188.114.96 188.114.97 188.114.98 188.114.99 8.6.112 8.34.70 8.34.146 8.35.211 8.39.125 8.39.204 8.39.214 8.47.69"
+# Used when no scan has run yet: WARP pools and the ports that get through here.
+# The provider routes the first group abroad (ARN/AMS/FRA) and most of the rest to
+# Moscow (checked 2026-10-21), so the first group is tried first; the rest stays as reserve.
+SEED_NETS_ABROAD="188.114.96 188.114.97 162.159.192"
+SEED_NETS="162.159.195 188.114.98 188.114.99 8.6.112 8.34.70 8.34.146 8.35.211 8.39.125 8.39.204 8.39.214 8.47.69"
 SEED_PORTS="2408 500 1701 4500"
 
 mkdir -p "$STATE" "$CONF_DIR"
-touch "$BENCH" "$GOOD" "$CANDS"
+touch "$BENCH" "$GOOD" "$CANDS" "$RU_NETS"
 
 log() { logger -t warp-watchdog "$*"; [ -t 1 ] && echo "$(date '+%T') $*"; }
 now() { date +%s; }
@@ -192,10 +202,12 @@ reroll() {
 	rr_count=$((rr_count + 1))
 	wan_ok || { log "session: internet itself is down, not re-rolling"; return 1; }
 	[ "$DRY_RUN" = 1 ] && { log "dry run: would re-roll the session ($1)"; return 0; }
-	rr_cur=$(endpoint); start=$(now); n=1
+	rr_cur=$(endpoint); rr_start=$rr_cur; start=$(now); n=1
 	while [ $n -le $REROLL_TRIES ]; do
 		rr_ep=$rr_cur
-		if [ $n -eq $REROLL_TRIES ]; then
+		# the provider routes some Cloudflare /24s to Moscow: after a Russian exit
+		# a new port rarely helps, another subnet usually does
+		if [ $n -eq $REROLL_TRIES ] || ru_net "$rr_cur"; then
 			rr_ep=$(pick "$rr_cur") || rr_ep=$rr_cur
 		fi
 		if ! ip link show "$IFACE" >/dev/null 2>&1 || iface_settling; then
@@ -211,8 +223,12 @@ reroll() {
 			[ "$rr_ep" != "$rr_cur" ] && { apply "$rr_cur"; wait_colo >/dev/null; }
 		elif ru_colo "$c"; then
 			why="exits via $c"
+			mark_ru "$rr_ep"
+			# the tunnel works there: the next try moves on from this subnet
+			rr_cur=$rr_ep
 		elif tg_api || tg_api; then
-			if [ "$rr_ep" != "$rr_cur" ]; then persist "$rr_ep"; remember_good "$rr_ep"; fi
+			if [ "$rr_ep" != "$rr_start" ]; then persist "$rr_ep"; remember_good "$rr_ep"; fi
+			unmark_ru "$rr_ep"
 			log "session: re-rolled ($1) -> $rr_ep exits $c, try $n, took $(( $(now) - start ))s"
 			exit_colo=$c
 			return 0
@@ -223,6 +239,7 @@ reroll() {
 		n=$((n + 1))
 	done
 	exit_colo=$c
+	[ "$rr_cur" != "$rr_start" ] && persist "$rr_cur"
 	log "session: no foreign exit with working Telegram after $REROLL_TRIES tries, staying on $rr_cur (${c:-no answer})"
 	return 1
 }
@@ -236,6 +253,18 @@ ai_ok() {
 opera_ok() {
 	c=$(curl -s -m 8 -x "http://$OPERA_PROXY" -o /dev/null -w '%{http_code}' https://www.google.com/ 2>/dev/null)
 	[ -n "$c" ] && [ "$c" != 000 ]
+}
+
+# checked on its own every 30 s: a hung opera-proxy otherwise waits for the AI check and its 10 min gap
+check_opera() {
+	if opera_ok; then op_f=0; return 0; fi
+	op_f=$((op_f + 1))
+	[ $op_f -ge $OPERA_FAILS ] || return 0
+	[ $(( $(now) - last_opera )) -ge $OPERA_GAP ] || return 0
+	wan_ok || return 0
+	last_opera=$(now); op_f=0
+	log "opera: proxy does not answer - restarting opera-proxy"
+	[ "$DRY_RUN" = 1 ] || /etc/init.d/opera-proxy restart
 }
 
 check_path() {
@@ -273,29 +302,51 @@ bench() {
 	mv "$BENCH.tmp" "$BENCH"
 }
 
+ru_net() {
+	awk -v n="$(net24 "$1")" -v t="$(now)" '$1 == n && $2 > t { f = 1 } END { exit !f }' "$RU_NETS"
+}
+
+mark_ru() {
+	n=$(net24 "$1")
+	awk -v n="$n" -v t="$(now)" '$1 != n && $2 > t' "$RU_NETS" > "$RU_NETS.tmp"
+	echo "$n $(( $(now) + RU_NET_SECS ))" >> "$RU_NETS.tmp"
+	mv "$RU_NETS.tmp" "$RU_NETS"
+}
+
+unmark_ru() {
+	awk -v n="$(net24 "$1")" '$1 != n' "$RU_NETS" > "$RU_NETS.tmp"
+	mv "$RU_NETS.tmp" "$RU_NETS"
+}
+
 remember_good() {
 	{ echo "$1"; grep -vxF "$1" "$GOOD"; } | head -n 20 > "$GOOD.tmp"
 	mv "$GOOD.tmp" "$GOOD"
 }
 
 seed() {
-	for n in $SEED_NETS; do
-		for p in $SEED_PORTS; do
-			echo "$RANDOM $n.$(( RANDOM % 254 + 1 )):$p"
-		done
-	done | sort -n | awk '{print $2}'
+	for nets in "$SEED_NETS_ABROAD" "$SEED_NETS"; do
+		for n in $nets; do
+			for p in $SEED_PORTS; do
+				echo "$RANDOM $n.$(( RANDOM % 254 + 1 )):$p"
+			done
+		done | sort -n | awk '{print $2}'
+	done
 }
 
 # Next endpoint to try: known-good first, then the scan, then random seeds;
-# a different /24 than the current one first, since blocks tend to hit a whole range
+# a different /24 than the current one first, since blocks tend to hit a whole range,
+# and /24s that just exited via Russia only when nothing else is left
 pick() {
 	cur=$1
 	cur_net=$(net24 "$cur")
-	for pass in other same; do
+	for pass in abroad other same; do
 		for e in $(cat "$GOOD" "$CANDS"; seed); do
 			[ "$e" = "$cur" ] && continue
-			if [ "$pass" = other ]; then
+			if [ "$pass" != same ]; then
 				[ "$(net24 "$e")" = "$cur_net" ] && continue
+			fi
+			if [ "$pass" = abroad ]; then
+				ru_net "$e" && continue
 			fi
 			benched "$e" && continue
 			echo "$e"
@@ -439,7 +490,8 @@ write_status() {
 	telegram: rtt=${tg_ms}ms base=${tg_base}ms loss=$tg_loss/3 misses=$tg_miss slow_rounds=$tg_slow switches_10min=$tg_switches
 	telegram api: ${tg_api_s}s fails=$tg_api_f
 	exit: colo=${exit_colo:-?} rerolls_10min=$rr_count
-	path: ai_misses=$ai_f last_fix=${last_fix:-none}
+	path: ai_misses=$ai_f last_fix=${last_fix:-none} opera_misses=$op_f
+	ru_nets: $(awk -v t="$(now)" '$2 > t { printf "%s ", $1 }' "$RU_NETS")
 	candidates=$(wc -l < "$CANDS") good=$(wc -l < "$GOOD") benched=$(awk -v t="$(now)" '$2 > t' "$BENCH" | wc -l)
 	updated=$(date '+%F %T')
 	EOF
@@ -450,7 +502,7 @@ run() {
 	# let ZeroBlock finish its own start-up work on the tunnel first
 	sleep "${START_DELAY:-120}"
 	fails=0; slow=0; base=0; q_loss=0; q_ms=0; sp=""
-	ai_f=0; last_recover=0; last_fix=""; tg_api_f=0; tg_api_s=0
+	ai_f=0; last_recover=0; last_fix=""; tg_api_f=0; tg_api_s=0; op_f=0; last_opera=0
 	exit_colo=""; rr_count=0; rr_win_start=0; rr_capped=0
 	tg_miss=0; tg_slow=0; tg_base=0; tg_loss=0; tg_ms=0; tg_switches=0; tg_win_start=0; tg_capped=0
 	t=$(now)
@@ -537,6 +589,7 @@ run() {
 				c=$(colo)
 				[ -n "$c" ] && exit_colo=$c
 				if [ -n "$c" ] && ru_colo "$c"; then
+					mark_ru "$(endpoint)"
 					reroll "exit via $c"
 					tg_base=0; base=0
 					write_status
@@ -559,6 +612,7 @@ run() {
 			if [ $tg_slow -ge $TG_SLOW_ROUNDS ]; then
 				tg_switch "slow (loss $tg_loss/3, ${tg_ms}ms vs usual ${tg_base}ms)" && { write_status; continue; }
 			fi
+			check_opera
 			if [ "$t" -ge "$next_ai" ]; then
 				next_ai=$((t + AI_EVERY))
 				check_path
